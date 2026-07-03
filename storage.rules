@@ -1,0 +1,16 @@
+rules_version = '2';
+service firebase.storage {
+  match /b/{bucket}/o {
+    // Helper function to check if user has admin email
+    function isAdmin() {
+      return request.auth != null && 
+        (request.auth.token.email == 'divashotsstudios@gmail.com' || 
+         request.auth.token.email == 'admin@divashotsstudios.com');
+    }
+
+    match /galleries/{galleryId}/{allPaths=**} {
+      allow read: if true; // Public reads to allow direct image display via download URL
+      allow write, delete: if isAdmin();
+    }
+  }
+}

@@ -1,0 +1,35 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // Helper function to check if user has admin email
+    function isAdmin() {
+      return request.auth != null && 
+        (request.auth.token.email == 'divashotsstudios@gmail.com' || 
+         request.auth.token.email == 'admin@divashotsstudios.com');
+    }
+    
+    // Check if user is authenticated at all (e.g. anonymous or google)
+    function isAuth() {
+      return request.auth != null;
+    }
+
+    match /settings/studio {
+      allow read: if true;
+      allow write: if isAdmin();
+    }
+
+    match /galleries/{galleryId} {
+      allow read: if true; // Open read since client selection links are obfuscated/direct
+      allow create, delete: if isAdmin();
+      allow update: if isAdmin() || (isAuth() && 
+        // Allow clients to submit selection updates safely
+        request.resource.data.diff(resource.data).affectedKeys().hasOnly(['photos', 'selectedCount', 'submittedAt', 'extraPhotosCount', 'extraAmountDue', 'status']));
+    }
+
+    match /files/{fileId} {
+      allow read: if true;
+      allow create, update: if isAdmin();
+      allow delete: if isAdmin();
+    }
+  }
+}
