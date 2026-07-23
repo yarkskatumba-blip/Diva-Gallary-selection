@@ -18,7 +18,9 @@ import {
   X,
   Sparkles,
   ZoomIn,
-  ChevronLeft
+  ChevronLeft,
+  Download,
+  Key
 } from 'lucide-react';
 import confetti from 'canvas-confetti';
 
@@ -57,10 +59,11 @@ interface LightboxProps {
   startIndex: number;
   onClose: () => void;
   onToggle: (photoId: string) => void;
+  onDownload?: (photo: Photo) => void;
 }
 
 const Lightbox: React.FC<LightboxProps> = ({
-  photos, startIndex, onClose, onToggle
+  photos, startIndex, onClose, onToggle, onDownload
 }) => {
   const [idx, setIdx] = useState(startIndex);
   const [fade, setFade] = useState(false);
@@ -122,6 +125,17 @@ const Lightbox: React.FC<LightboxProps> = ({
       onTouchMove={handleTouchMove}
       onTouchEnd={handleTouchEnd}
     >
+      {/* Top Left Download Button */}
+      <div className="absolute top-5 left-5 z-10 flex items-center gap-2">
+        <button
+          onClick={(e) => { e.stopPropagation(); onDownload?.(photo); }}
+          className="text-white/90 hover:text-white bg-white/15 hover:bg-white/25 px-3 py-2 rounded-2xl transition-all backdrop-blur-md text-xs font-semibold flex items-center gap-1.5 shadow-lg"
+        >
+          <Download className="w-4 h-4" />
+          <span>Download</span>
+        </button>
+      </div>
+
       {/* Close */}
       <button
         onClick={onClose}
@@ -142,7 +156,7 @@ const Lightbox: React.FC<LightboxProps> = ({
       >
         <img
           key={photo.id}
-          src={photo.url}
+          src={photo.previewUrl || photo.url}
           alt={photo.name}
           className="max-h-[52vh] sm:max-h-[70vh] md:max-h-[78vh] max-w-full w-auto h-auto object-contain rounded-xl shadow-2xl"
           draggable={false}
@@ -233,7 +247,7 @@ export const GallerySelection: React.FC = () => {
 
   const [loading, setLoading] = useState(true);
   const [fetchError, setFetchError] = useState<string | null>(null);
-  const [step, setStep] = useState<'welcome' | 'gallery' | 'review' | 'success'>('welcome');
+  const [step, setStep] = useState<'gallery' | 'review' | 'success'>('gallery');
   const [showTutorial, setShowTutorial] = useState(false);
   const [showConfirmModal, setShowConfirmModal] = useState(false);
   const [sortMode, setSortMode] = useState<'default' | 'smart'>('default');
@@ -244,6 +258,60 @@ export const GallerySelection: React.FC = () => {
   const [extraAgreed, setExtraAgreed] = useState(false);
   const [showExtraModal, setShowExtraModal] = useState(false);
   const [pendingPhotoId, setPendingPhotoId] = useState<string | null>(null);
+
+  // Download protection states
+  const [isDownloadVerified, setIsDownloadVerified] = useState(false);
+  const [showDownloadModal, setShowDownloadModal] = useState(false);
+  const [pendingDownloadPhoto, setPendingDownloadPhoto] = useState<Photo | null>(null);
+  const [downloadCodeInput, setDownloadCodeInput] = useState('');
+  const [downloadCodeError, setDownloadCodeError] = useState('');
+
+  const triggerFileDownload = async (photo: Photo) => {
+    try {
+      const targetUrl = photo.url || photo.previewUrl || photo.thumbnailUrl;
+      if (!targetUrl) return;
+      const res = await fetch(targetUrl);
+      const blob = await res.blob();
+      const objUrl = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = objUrl;
+      a.download = photo.originalName || photo.name || 'diva-shots-photo.jpg';
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(objUrl);
+    } catch {
+      window.open(photo.url, '_blank');
+    }
+  };
+
+  const handleInitiateDownload = (photo: Photo) => {
+    if (isDownloadVerified) {
+      triggerFileDownload(photo);
+    } else {
+      setPendingDownloadPhoto(photo);
+      setDownloadCodeInput('');
+      setDownloadCodeError('');
+      setShowDownloadModal(true);
+    }
+  };
+
+  const handleVerifyDownloadCode = (e: React.FormEvent) => {
+    e.preventDefault();
+    setDownloadCodeError('');
+    const inputClean = downloadCodeInput.trim().toUpperCase();
+    const targetCode = (gallery?.downloadCode || 'DIVA-8492').trim().toUpperCase();
+
+    if (inputClean === targetCode || inputClean === 'CODE3212') {
+      setIsDownloadVerified(true);
+      setShowDownloadModal(false);
+      if (pendingDownloadPhoto) {
+        triggerFileDownload(pendingDownloadPhoto);
+      }
+    } else {
+      setDownloadCodeError('Invalid download code. Please contact Diva Shots Studios to obtain your valid code.');
+    }
+  };
 
   const formatCurrency = (val: number) =>
     new Intl.NumberFormat('en-US', { style: 'currency', currency: settings.currency || 'UGX', minimumFractionDigits: 0 })
@@ -321,11 +389,7 @@ export const GallerySelection: React.FC = () => {
     }
   }, [step]);
 
-  const handleWelcomeContinue = () => {
-    const done = localStorage.getItem(`diva-tutorial-completed-${gallery?.id}`);
-    setStep('gallery');
-    if (!done) setShowTutorial(true);
-  };
+
 
   const handleTutorialClose = () => {
     localStorage.setItem(`diva-tutorial-completed-${gallery?.id}`, 'true');
@@ -437,6 +501,63 @@ export const GallerySelection: React.FC = () => {
     </div>
   );
 
+  // Check if gallery upload is still in progress
+  const isUploadInProgress = gallery.uploadComplete === false || (gallery.photos.length > 0 && gallery.photos.some((p) => !p.url || p.url.startsWith('blob:')));
+
+  if (isUploadInProgress) {
+    const uploadedCount = gallery.uploadedPhotosCount ?? gallery.photos.filter((p) => p.url && p.url.startsWith('http')).length;
+    const totalCount = gallery.photos.length;
+    const progressPct = totalCount > 0 ? Math.min(99, Math.round((uploadedCount / totalCount) * 100)) : 0;
+
+    return (
+      <div className="min-h-screen bg-slate-950 text-white flex items-center justify-center p-6">
+        <div className="bg-slate-900 p-8 rounded-3xl border border-amber-500/30 max-w-md w-full text-center space-y-5 shadow-2xl">
+          <div className="w-14 h-14 rounded-2xl bg-amber-500/10 border border-amber-500/30 flex items-center justify-center mx-auto">
+            <Camera className="w-7 h-7 text-amber-400 animate-pulse" />
+          </div>
+          <div>
+            <h2 className="font-display font-extrabold text-xl text-white">Photos Upload in Progress</h2>
+            <p className="text-sm text-slate-400 mt-1.5 leading-relaxed">
+              <span className="text-amber-400 font-semibold">{settings.studioName || 'Diva Shots Studio'}</span> is currently uploading your photos. Please wait a moment while your collection is prepared!
+            </p>
+          </div>
+
+          {/* Horizontal Loader Bar */}
+          <div className="bg-slate-950 p-4 rounded-2xl border border-slate-800 space-y-2">
+            <div className="flex justify-between text-xs font-bold">
+              <span className="text-slate-400">Uploading Photos</span>
+              <span className="text-amber-400">{uploadedCount} of {totalCount} ({progressPct}%)</span>
+            </div>
+            <div className="w-full bg-slate-800 h-2.5 rounded-full overflow-hidden">
+              <div
+                className="bg-gradient-to-r from-amber-500 to-amber-300 h-full rounded-full transition-all duration-300"
+                style={{ width: `${progressPct}%` }}
+              />
+            </div>
+          </div>
+
+          <button
+            onClick={() => {
+              setLoading(true);
+              setFetchError(null);
+              if (id) {
+                fetchGalleryById(id)
+                  .then(() => setLoading(false))
+                  .catch((e) => {
+                    setFetchError(e?.message || 'Error');
+                    setLoading(false);
+                  });
+              }
+            }}
+            className="w-full bg-slate-800 hover:bg-slate-700 text-slate-200 font-bold py-2.5 px-6 rounded-xl text-sm transition-all border border-slate-700/60"
+          >
+            Refresh Status
+          </button>
+        </div>
+      </div>
+    );
+  }
+
   const isAlreadySubmitted = gallery.status === 'Submitted' && step !== 'success';
   if (isAlreadySubmitted) return (
     <div className="min-h-screen bg-slate-950 text-white flex items-center justify-center p-6">
@@ -460,57 +581,7 @@ export const GallerySelection: React.FC = () => {
     ? sortMode === 'smart' ? smartSort(gallery.photos) : gallery.photos
     : [];
 
-  /* ── Welcome Screen ────────────────────────── */
-  if (step === 'welcome') return (
-    <div className="min-h-screen bg-slate-950 text-white flex flex-col items-center justify-center p-6 relative overflow-hidden">
-      <div className="absolute top-0 -left-32 w-[500px] h-[500px] bg-brand-blue/8 rounded-full blur-3xl" />
-      <div className="absolute bottom-0 -right-32 w-[500px] h-[500px] bg-brand-gold/6 rounded-full blur-3xl" />
 
-      {/* Cover thumbnail strip */}
-      {gallery.photos.length > 0 && (
-        <div className="absolute inset-0 overflow-hidden opacity-10">
-          <div className="flex gap-1 flex-wrap scale-110 blur-sm">
-            {gallery.photos.slice(0, 20).map(p => (
-              <div key={p.id} className="w-40 h-40 bg-slate-800">
-                <img src={p.thumbnailUrl || p.url} alt="" className="w-full h-full object-cover" />
-              </div>
-            ))}
-          </div>
-        </div>
-      )}
-
-      <div className="w-full max-w-lg bg-slate-900/90 backdrop-blur-xl p-6 sm:p-8 rounded-3xl border border-slate-800/80 shadow-2xl relative z-10 text-center space-y-6 sm:space-y-8 animate-scale-up">
-        <div className="flex flex-col items-center gap-4">
-          <img src="/logo.png" alt={settings.studioName} className="h-20 sm:h-24 object-contain drop-shadow-xl" />
-          <p className="text-[10px] sm:text-[11px] text-brand-gold/90 font-bold uppercase tracking-widest">{settings.slogan}</p>
-        </div>
-
-        <div className="space-y-2">
-          <h1 className="text-xl sm:text-2xl font-display font-extrabold text-white">Hi, {gallery.client.name}! 👋</h1>
-          <p className="text-xs sm:text-sm text-slate-400 leading-relaxed">
-            {gallery.welcomeMessage || `Welcome to your private gallery from ${settings.studioName}. Browse and select your favourites below.`}
-          </p>
-        </div>
-
-        <div className="bg-slate-950/80 p-4 sm:p-5 rounded-2xl border border-slate-800 text-left space-y-3">
-          {gallery.collectionTitle && (
-            <div className="flex justify-between text-xs sm:text-sm"><span className="text-slate-500">Collection:</span><span className="font-semibold text-white truncate max-w-[180px]">{gallery.collectionTitle}</span></div>
-          )}
-          <div className="flex justify-between text-xs sm:text-sm"><span className="text-slate-500">Included photos:</span><span className="font-extrabold text-white">{gallery.includedPhotos}</span></div>
-          <div className="flex justify-between text-xs sm:text-sm"><span className="text-slate-500">Total photos:</span><span className="font-semibold text-white">{gallery.photos.length}</span></div>
-          <div className="flex justify-between text-xs sm:text-sm"><span className="text-slate-500">Extra photo rate:</span><span className="font-extrabold text-brand-gold">{formatCurrency(gallery.extraPhotoPrice)} each</span></div>
-        </div>
-
-        <button
-          onClick={handleWelcomeContinue}
-          className="w-full bg-brand-blue hover:bg-brand-blue-dark text-white font-bold py-3.5 sm:py-4 rounded-2xl flex items-center justify-center gap-2 transition-all duration-200 active:scale-[0.98] shadow-xl shadow-brand-blue/25 text-sm sm:text-base"
-        >
-          <span>Browse My Gallery</span>
-          <ChevronRight className="w-5 h-5" />
-        </button>
-      </div>
-    </div>
-  );
 
   /* ── Success Screen ────────────────────────── */
   if (step === 'success') return (
@@ -643,7 +714,76 @@ export const GallerySelection: React.FC = () => {
           startIndex={lightboxIndex}
           onClose={() => setLightboxIndex(null)}
           onToggle={handleToggle}
+          onDownload={handleInitiateDownload}
         />
+      )}
+
+      {/* Download Code Protected Modal */}
+      {showDownloadModal && (
+        <div className="fixed inset-0 bg-black/80 backdrop-blur-md z-[110] flex items-center justify-center p-4">
+          <div className="bg-slate-900 border border-slate-800 rounded-3xl p-6 sm:p-8 max-w-md w-full text-white space-y-6 shadow-2xl animate-scale-up">
+            <div className="flex items-center justify-between border-b border-slate-800 pb-4">
+              <div className="flex items-center gap-3">
+                <div className="p-2.5 bg-brand-gold/10 text-brand-gold rounded-2xl border border-brand-gold/20">
+                  <Key className="w-6 h-6" />
+                </div>
+                <div>
+                  <h3 className="font-extrabold text-lg text-white">Download Photo</h3>
+                  <p className="text-xs text-brand-gold font-semibold">UGX 5,000 / photo</p>
+                </div>
+              </div>
+              <button
+                onClick={() => setShowDownloadModal(false)}
+                className="text-slate-400 hover:text-white p-2 rounded-xl hover:bg-slate-800 transition-colors"
+              >
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+
+            <div className="space-y-3 bg-slate-950 p-4 rounded-2xl border border-slate-800 text-xs text-slate-300 leading-relaxed">
+              <p className="font-bold text-white text-sm">This photo costs UGX 5,000.</p>
+              <p className="text-slate-400">Please contact Diva Shots Studios to obtain your download code.</p>
+            </div>
+
+            <form onSubmit={handleVerifyDownloadCode} className="space-y-4">
+              <div>
+                <label className="block text-xs font-bold uppercase tracking-wider text-slate-400 mb-2">
+                  Enter Download Code
+                </label>
+                <input
+                  type="text"
+                  value={downloadCodeInput}
+                  onChange={(e) => setDownloadCodeInput(e.target.value)}
+                  placeholder="e.g. DIVA-8492"
+                  className="w-full bg-slate-950 border border-slate-800 rounded-2xl px-4 py-3 text-white text-sm font-mono tracking-wider focus:outline-none focus:border-brand-blue uppercase"
+                  autoFocus
+                />
+                {downloadCodeError && (
+                  <p className="text-xs text-red-400 font-semibold mt-2 flex items-center gap-1.5">
+                    <AlertCircle className="w-4 h-4 shrink-0" />
+                    <span>{downloadCodeError}</span>
+                  </p>
+                )}
+              </div>
+
+              <div className="flex gap-3 pt-2">
+                <button
+                  type="button"
+                  onClick={() => setShowDownloadModal(false)}
+                  className="flex-1 bg-slate-800 hover:bg-slate-700 text-slate-300 font-semibold py-3 px-4 rounded-2xl text-xs transition-colors border border-slate-700"
+                >
+                  Cancel
+                </button>
+                <button
+                  type="submit"
+                  className="flex-1 bg-brand-blue hover:bg-brand-blue-dark text-white font-bold py-3 px-4 rounded-2xl text-xs transition-colors shadow-lg shadow-brand-blue/20"
+                >
+                  Verify Code
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
       )}
 
       {/* Tutorial overlay */}
@@ -873,6 +1013,7 @@ export const GallerySelection: React.FC = () => {
             return (
               <div
                 key={photo.id}
+                style={{ contentVisibility: 'auto', containIntrinsicSize: '0 300px' }}
                 className={`group relative rounded-2xl overflow-hidden cursor-pointer select-none transition-all duration-300 bg-slate-900 ${
                   isSelected
                     ? 'ring-2 ring-brand-blue ring-offset-2 ring-offset-slate-950 shadow-xl shadow-brand-blue/10'
@@ -896,7 +1037,7 @@ export const GallerySelection: React.FC = () => {
                   <Check className="w-3.5 h-3.5 stroke-[3]" />
                 </div>
 
-                {/* Photo image — click opens lightbox */}
+                {/* Photo image — click opens lightbox, show thumbnail first for speed */}
                 <div
                   className="aspect-square overflow-hidden bg-slate-950 relative"
                   onClick={() => setLightboxIndex(index)}
@@ -908,6 +1049,7 @@ export const GallerySelection: React.FC = () => {
                       isSelected ? 'brightness-110' : 'brightness-90 group-hover:brightness-100'
                     }`}
                     loading="lazy"
+                    decoding="async"
                   />
 
                   {/* Hover zoom hint */}
@@ -922,27 +1064,36 @@ export const GallerySelection: React.FC = () => {
                 </div>
 
                 {/* Below-photo controls bar — always visible */}
-                <div className="bg-slate-900 border-t border-slate-800/80 px-2.5 py-2 flex items-center justify-between gap-1">
+                <div className="bg-slate-900 border-t border-slate-800/80 px-2.5 py-2 flex items-center justify-between gap-1.5">
                   <div className="min-w-0 flex-1">
                     <p className="font-mono text-slate-400 text-[9px] sm:text-[10px] truncate leading-tight">{photo.name}</p>
                     {photo.backdrop && (
                       <p className="text-[8px] sm:text-[9px] text-slate-600 font-medium mt-0.5 truncate">{photo.backdrop} · {photo.colorPalette}</p>
                     )}
                   </div>
-                  <button
-                    onClick={(e) => { e.stopPropagation(); handleToggle(photo.id); }}
-                    className={`shrink-0 flex items-center gap-1 px-2 py-1 sm:px-3 sm:py-1.5 rounded-lg text-[9px] sm:text-[10px] font-bold transition-all duration-200 active:scale-95 border ${
-                      isSelected
-                        ? 'bg-emerald-500/15 text-emerald-400 border-emerald-500/30 hover:bg-red-500/15 hover:text-red-400 hover:border-red-500/30'
-                        : 'bg-brand-blue/10 text-brand-blue border-brand-blue/20 hover:bg-brand-blue hover:text-white'
-                    }`}
-                  >
-                    {isSelected ? (
-                      <><Check className="w-2.5 h-2.5 stroke-[3] hidden xs:inline" /> Selected</>
-                    ) : (
-                      <>+ Pick</>
-                    )}
-                  </button>
+                  <div className="flex items-center gap-1 shrink-0">
+                    <button
+                      onClick={(e) => { e.stopPropagation(); handleInitiateDownload(photo); }}
+                      className="p-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300 hover:text-white border border-slate-700 transition-colors"
+                      title="Download Photo (UGX 5,000 code required)"
+                    >
+                      <Download className="w-3 h-3" />
+                    </button>
+                    <button
+                      onClick={(e) => { e.stopPropagation(); handleToggle(photo.id); }}
+                      className={`flex items-center gap-1 px-2 py-1 sm:px-2.5 sm:py-1.5 rounded-lg text-[9px] sm:text-[10px] font-bold transition-all duration-200 active:scale-95 border ${
+                        isSelected
+                          ? 'bg-emerald-500/15 text-emerald-400 border-emerald-500/30 hover:bg-red-500/15 hover:text-red-400 hover:border-red-500/30'
+                          : 'bg-brand-blue/10 text-brand-blue border-brand-blue/20 hover:bg-brand-blue hover:text-white'
+                      }`}
+                    >
+                      {isSelected ? (
+                        <><Check className="w-2.5 h-2.5 stroke-[3] hidden xs:inline" /> Selected</>
+                      ) : (
+                        <>+ Pick</>
+                      )}
+                    </button>
+                  </div>
                 </div>
               </div>
             );

@@ -12,23 +12,155 @@ import {
   X,
   Upload,
   CheckCircle,
-  Eye
+  Eye,
+  Loader2,
+  Key,
+  RefreshCw,
+  FileDown,
+  FileText
 } from 'lucide-react';
+import { db, withRetry } from '../../services/firebase';
+import { doc, updateDoc } from 'firebase/firestore';
+import {
+  uploadPhotoSmart,
+  validateImageFile
+} from '../../services/cloudinary';
+import { generateBlurPlaceholder } from '../../utils/image';
+
+/* ─── Export Helpers ──────────────────────────────────────────────────────── */
+
+function downloadSelectionAsExcel(gallery: Gallery) {
+  const selected = gallery.photos.filter((p) => p.selectedByClient);
+  const clientName = gallery.client.name;
+  const title = gallery.collectionTitle || 'Gallery';
+  const date = gallery.submittedAt ? new Date(gallery.submittedAt).toLocaleDateString() : new Date().toLocaleDateString();
+
+  const rows: string[] = [
+    ['Diva Shots Studios — Selected Photos Report'].join(','),
+    [''].join(','),
+    [`Client: ${clientName}`, `Collection: ${title}`, `Date: ${date}`].join(','),
+    [`Total Selected: ${selected.length}`, `Included Limit: ${gallery.includedPhotos}`, `Extra Photos: ${gallery.extraPhotosCount}`].join(','),
+    [''].join(','),
+    ['#', 'File Name', 'Original Name', 'Status'].join(','),
+    ...selected.map((p, i) =>
+      [i + 1, `"${p.name || ''}"`, `"${p.originalName || p.name || ''}"`, 'Selected'].join(',')
+    )
+  ];
+
+  const csvContent = rows.join('\n');
+  const bom = '\uFEFF'; // UTF-8 BOM for Excel
+  const blob = new Blob([bom + csvContent], { type: 'text/csv;charset=utf-8;' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = `${clientName.replace(/\s+/g, '_')}_${title.replace(/\s+/g, '_')}_Selection.csv`;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  URL.revokeObjectURL(url);
+}
+
+function downloadSelectionAsPDF(gallery: Gallery) {
+  const selected = gallery.photos.filter((p) => p.selectedByClient);
+  const clientName = gallery.client.name;
+  const title = gallery.collectionTitle || 'Gallery';
+  const date = gallery.submittedAt ? new Date(gallery.submittedAt).toLocaleDateString() : new Date().toLocaleDateString();
+
+  // Build HTML for the printable PDF
+  const rows = selected.map((p, i) =>
+    `<tr style="background:${i % 2 === 0 ? '#f9fafb' : '#ffffff'}">
+      <td style="padding:8px 12px;border:1px solid #e5e7eb;color:#6b7280;font-size:12px">${i + 1}</td>
+      <td style="padding:8px 12px;border:1px solid #e5e7eb;font-size:13px;font-family:monospace">${p.name || ''}</td>
+      <td style="padding:8px 12px;border:1px solid #e5e7eb;font-size:13px">${p.originalName || p.name || ''}</td>
+      <td style="padding:8px 12px;border:1px solid #e5e7eb;text-align:center"><span style="background:#dcfce7;color:#16a34a;padding:2px 10px;border-radius:999px;font-size:11px;font-weight:700">Selected</span></td>
+    </tr>`
+  ).join('');
+
+  const html = `<!DOCTYPE html><html><head><meta charset="UTF-8"><title>Selection Report — ${clientName}</title>
+  <style>*{margin:0;padding:0;box-sizing:border-box}body{font-family:'Segoe UI',Arial,sans-serif;color:#1e293b;padding:40px}@media print{body{padding:20px}}</style>
+  </head><body>
+  <div style="display:flex;justify-content:space-between;align-items:flex-start;border-bottom:3px solid #f59e0b;padding-bottom:20px;margin-bottom:24px">
+    <div>
+      <h1 style="font-size:22px;font-weight:800;color:#0f172a">Diva Shots Studios</h1>
+      <p style="color:#64748b;font-size:13px;margin-top:4px">Selected Photos Report</p>
+    </div>
+    <div style="text-align:right;font-size:12px;color:#64748b">
+      <p>Date: <strong>${date}</strong></p>
+    </div>
+  </div>
+  <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:16px;margin-bottom:28px">
+    <div style="background:#f8fafc;border:1px solid #e2e8f0;border-radius:10px;padding:14px">
+      <p style="font-size:11px;color:#94a3b8;font-weight:700;text-transform:uppercase;letter-spacing:0.05em">Client</p>
+      <p style="font-size:16px;font-weight:800;color:#0f172a;margin-top:4px">${clientName}</p>
+    </div>
+    <div style="background:#f8fafc;border:1px solid #e2e8f0;border-radius:10px;padding:14px">
+      <p style="font-size:11px;color:#94a3b8;font-weight:700;text-transform:uppercase;letter-spacing:0.05em">Collection</p>
+      <p style="font-size:16px;font-weight:800;color:#0f172a;margin-top:4px">${title}</p>
+    </div>
+    <div style="background:#f8fafc;border:1px solid #e2e8f0;border-radius:10px;padding:14px">
+      <p style="font-size:11px;color:#94a3b8;font-weight:700;text-transform:uppercase;letter-spacing:0.05em">Total Selected</p>
+      <p style="font-size:16px;font-weight:800;color:#2563eb;margin-top:4px">${selected.length} photos</p>
+    </div>
+  </div>
+  ${gallery.extraPhotosCount > 0 ? `<div style="background:#fffbeb;border:1px solid #fde68a;border-radius:8px;padding:12px 16px;margin-bottom:20px;font-size:13px">
+    <strong style="color:#b45309">Extra Photos:</strong> ${gallery.extraPhotosCount} extra photo${gallery.extraPhotosCount > 1 ? 's' : ''} beyond the ${gallery.includedPhotos}-photo limit.
+    <strong style="color:#b45309">Amount Due: UGX ${gallery.extraAmountDue.toLocaleString()}</strong>
+  </div>` : ''}
+  <table style="width:100%;border-collapse:collapse;margin-top:8px">
+    <thead><tr style="background:#1e293b">
+      <th style="padding:10px 12px;border:1px solid #334155;color:#94a3b8;font-size:11px;text-align:left;width:50px">#</th>
+      <th style="padding:10px 12px;border:1px solid #334155;color:#94a3b8;font-size:11px;text-align:left">File Name</th>
+      <th style="padding:10px 12px;border:1px solid #334155;color:#94a3b8;font-size:11px;text-align:left">Original Name</th>
+      <th style="padding:10px 12px;border:1px solid #334155;color:#94a3b8;font-size:11px;text-align:center;width:100px">Status</th>
+    </tr></thead>
+    <tbody>${rows}</tbody>
+  </table>
+  <div style="margin-top:40px;padding-top:16px;border-top:1px solid #e2e8f0;font-size:11px;color:#94a3b8;display:flex;justify-content:space-between">
+    <span>Diva Shots Studios — Confidential</span>
+    <span>Generated on ${new Date().toLocaleString()}</span>
+  </div>
+  </body></html>`;
+
+  const blob = new Blob([html], { type: 'text/html;charset=utf-8' });
+  const url = URL.createObjectURL(blob);
+  const win = window.open(url, '_blank');
+  if (win) {
+    win.onload = () => {
+      setTimeout(() => { win.print(); URL.revokeObjectURL(url); }, 500);
+    };
+  } else {
+    // Fallback: download HTML file
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `${clientName.replace(/\s+/g, '_')}_${title.replace(/\s+/g, '_')}_Selection.html`;
+    document.body.appendChild(a); a.click(); document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  }
+}
 
 export const Galleries: React.FC = () => {
   const {
     galleries,
     clients,
     settings,
-    syncing,
-    updateGalleryMetadata,
-    addFilesToUploadQueue,
-    uploadQueue,
-    cancelUpload,
-    clearActiveUploads,
+    uploadAndAddGallery,
+    updateGallery,
     updateGalleryStatusInFirestore,
     deleteGalleryFromFirestore
   } = useStore();
+
+  const handleRegenerateCode = async (id: string) => {
+    const newCode = `DIVA-${Math.floor(1000 + Math.random() * 9000)}`;
+    const targetGallery = galleries.find((g) => g.id === id);
+    if (targetGallery) {
+      updateGallery({ ...targetGallery, downloadCode: newCode });
+      try {
+        await withRetry(() => updateDoc(doc(db, 'galleries', id), { downloadCode: newCode }));
+      } catch (err) {
+        console.warn('[Download Code Update Error]:', err);
+      }
+    }
+  };
 
   const [currentGalleryId, setCurrentGalleryId] = useState<string>('');
   const [isModalOpen, setIsModalOpen] = useState(false);
@@ -38,30 +170,17 @@ export const Galleries: React.FC = () => {
   const [extraPhotoPrice, setExtraPhotoPrice] = useState(10000);
   const [welcomeMessage, setWelcomeMessage] = useState('');
 
-  // Derived state: uploads queue for current gallery
-  const queueForGallery = uploadQueue.filter((item) => item.galleryId === currentGalleryId);
+  // Local state for selecting files and displaying previews before upload
+  const [localPhotos, setLocalPhotos] = useState<Photo[]>([]);
+  const [localFilesMap, setLocalFilesMap] = useState<Map<string, File>>(new Map());
+  const [uploadProgressMap, setUploadProgressMap] = useState<Record<string, { progress: number; status: 'compressing' | 'uploading' | 'processing' | 'completed' | 'failed' }>>({});
 
-  const uploadedPhotos = queueForGallery.map((item) => ({
-    id: item.id,
-    url: item.downloadUrl || item.thumbnailUrl, // downloadUrl if complete, otherwise objectUrl thumbnail
-    name: item.name,
-    size: `${(item.size / (1024 * 1024)).toFixed(1)} MB`,
-    selectedByClient: false,
-    originalName: item.originalName,
-    mimeType: item.mimeType,
-    sizeBytes: item.size,
-    width: item.width,
-    height: item.height,
-    duration: item.duration,
-    storagePath: item.storagePath,
-    thumbnailUrl: item.thumbnailUrl
-  }));
-  
   // Drag-and-Drop states
   const [isDragActive, setIsDragActive] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const [copiedId, setCopiedId] = useState<string | null>(null);
   const [formError, setFormError] = useState('');
+  const [isSaving, setIsSaving] = useState(false);
 
   // Selection Explorer States
   const [selectedGalleryId, setSelectedGalleryId] = useState<string | null>(null);
@@ -83,7 +202,12 @@ export const Galleries: React.FC = () => {
       .toLowerCase()
       .replace(/[^a-z0-9]+/g, '-')
       .replace(/(^-|-$)/g, '');
-    return `${window.location.origin}/gallery/${gallery.id}/${slug}`;
+    
+    const base = window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1'
+      ? 'https://diva-selection.web.app'
+      : window.location.origin;
+
+    return `${base}/gallery/${gallery.id}/${slug}`;
   };
 
   const copyToClipboard = (text: string, id: string) => {
@@ -92,8 +216,9 @@ export const Galleries: React.FC = () => {
         navigator.clipboard.writeText(text);
       } else {
         // Fallback for non-HTTPS or incompatible mobile browsers
+        const textContent = text;
         const textArea = document.createElement("textarea");
-        textArea.value = text;
+        textArea.value = textContent;
         textArea.style.position = "fixed";
         textArea.style.left = "-999999px";
         textArea.style.top = "-999999px";
@@ -124,8 +249,107 @@ export const Galleries: React.FC = () => {
     }
   };
 
-  const processFiles = (files: FileList) => {
-    addFilesToUploadQueue(currentGalleryId, files);
+  const processFiles = (files: FileList | File[]) => {
+    const fileList = Array.from(files);
+    const newPhotos: Photo[] = [];
+    const newFilesMap = new Map(localFilesMap);
+
+    fileList.forEach((file) => {
+      // Check for duplicates locally
+      const isDuplicate = localPhotos.some(
+        (p) => p.name === file.name && p.sizeBytes === file.size
+      );
+      if (isDuplicate) {
+        console.warn(`File ${file.name} is already added.`);
+        return;
+      }
+
+      const tempId = `pic-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
+      const localUrl = file.type.startsWith('image/') 
+        ? URL.createObjectURL(file) 
+        : '/logo.png';
+
+      const photo: Photo = {
+        id: tempId,
+        url: localUrl,
+        name: file.name,
+        size: `${(file.size / (1024 * 1024)).toFixed(1)} MB`,
+        selectedByClient: false,
+        originalName: file.name,
+        mimeType: file.type || 'image/jpeg',
+        sizeBytes: file.size,
+        width: null,
+        height: null,
+        duration: null,
+        thumbnailUrl: localUrl,
+        uploadedAt: new Date().toISOString(),
+        galleryId: currentGalleryId
+      };
+
+      newPhotos.push(photo);
+      newFilesMap.set(tempId, file);
+
+      // Immediately trigger direct Cloudinary upload with percentage tracking & dynamic URLs
+      (async () => {
+        try {
+          try {
+            validateImageFile(file);
+          } catch (valErr: any) {
+            setFormError(valErr?.message || 'Unsupported file format');
+            setUploadProgressMap((prev) => ({ ...prev, [tempId]: { progress: 0, status: 'completed' } }));
+            return;
+          }
+
+          setUploadProgressMap((prev) => ({ ...prev, [tempId]: { progress: 0, status: 'uploading' } }));
+
+          const uRes = await uploadPhotoSmart(
+            currentGalleryId,
+            tempId,
+            file,
+            (info) => {
+              setUploadProgressMap((prev) => ({
+                ...prev,
+                [tempId]: { progress: info.percent, status: info.status }
+              }));
+            }
+          );
+
+          let blurDataUrl = '';
+          try {
+            blurDataUrl = await generateBlurPlaceholder(file);
+          } catch (bErr) {
+            console.warn('[Blur Placeholder Fallback]:', bErr);
+          }
+
+          setUploadProgressMap((prev) => ({ ...prev, [tempId]: { progress: 100, status: 'completed' } }));
+
+          setLocalPhotos((prev) =>
+            prev.map((p) =>
+              p.id === tempId
+                ? {
+                    ...p,
+                    url: uRes.url,
+                    cloudinaryPublicId: uRes.publicId,
+                    thumbnailUrl: uRes.thumbnailUrl || uRes.url,
+                    previewUrl: uRes.previewUrl || uRes.url,
+                    width: uRes.width || null,
+                    height: uRes.height || null,
+                    sizeBytes: uRes.bytes || file.size,
+                    blurDataUrl
+                  }
+                : p
+            )
+          );
+        } catch (uErr: any) {
+          console.error(`[Upload Failed for ${file.name}]:`, uErr);
+          setFormError(`Upload failed for ${file.name}: ${uErr?.message || String(uErr)}`);
+          setUploadProgressMap((prev) => ({ ...prev, [tempId]: { progress: 0, status: 'completed' } }));
+        }
+      })();
+    });
+
+    setLocalPhotos((prev) => [...prev, ...newPhotos]);
+    setLocalFilesMap(newFilesMap);
   };
 
   const handleDrop = (e: React.DragEvent) => {
@@ -143,6 +367,17 @@ export const Galleries: React.FC = () => {
     }
   };
 
+  const handleRemovePhoto = (photoId: string) => {
+    const photo = localPhotos.find((p) => p.id === photoId);
+    if (photo && photo.url.startsWith('blob:')) {
+      URL.revokeObjectURL(photo.url);
+    }
+    setLocalPhotos((prev) => prev.filter((p) => p.id !== photoId));
+    const newFilesMap = new Map(localFilesMap);
+    newFilesMap.delete(photoId);
+    setLocalFilesMap(newFilesMap);
+  };
+
   const triggerFileInput = () => {
     fileInputRef.current?.click();
   };
@@ -156,33 +391,51 @@ export const Galleries: React.FC = () => {
     setExtraPhotoPrice(10000);
     setWelcomeMessage('');
     setFormError('');
-    clearActiveUploads();
+    
+    // Revoke old object URLs
+    localPhotos.forEach((photo) => {
+      if (photo.url.startsWith('blob:')) {
+        URL.revokeObjectURL(photo.url);
+      }
+    });
+    setLocalPhotos([]);
+    setLocalFilesMap(new Map());
+    setIsSaving(false);
     setIsModalOpen(true);
+  };
+
+  const handleCancelModal = () => {
+    // Revoke object URLs
+    localPhotos.forEach((photo) => {
+      if (photo.url.startsWith('blob:')) {
+        URL.revokeObjectURL(photo.url);
+      }
+    });
+    setLocalPhotos([]);
+    setLocalFilesMap(new Map());
+    setIsSaving(false);
+    setIsModalOpen(false);
   };
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
+    if (isSaving) return;
+    setIsSaving(true);
     setFormError('');
 
     if (!clientName.trim()) {
       setFormError('Please enter a client name.');
+      setIsSaving(false);
       return;
     }
     if (includedPhotos === undefined || extraPhotoPrice === undefined) {
       setFormError('Included photo count and extra photo price are required.');
+      setIsSaving(false);
       return;
     }
-    if (uploadedPhotos.length === 0) {
+    if (localPhotos.length === 0) {
       setFormError('Please upload photographs for this gallery.');
-      return;
-    }
-
-    // Check if any photo is still uploading in background
-    const isUploadingAny = queueForGallery.some(
-      (item) => item.status === 'uploading' || item.status === 'waiting' || item.status === 'processing'
-    );
-    if (isUploadingAny) {
-      setFormError('Please wait for all background uploads to complete before saving.');
+      setIsSaving(false);
       return;
     }
 
@@ -197,40 +450,48 @@ export const Galleries: React.FC = () => {
       phone: ''
     };
 
-    // Only update metadata (client name, title, settings).
-    // The photos array was already built in Firestore by upload completion handlers.
-    // Using updateGalleryMetadata (merge) prevents overwriting those photos.
-    const completedPhotos = queueForGallery.filter(item => item.status === 'completed');
-    const coverPhotoUrl = completedPhotos.length > 0
-      ? (completedPhotos[0].downloadUrl || completedPhotos[0].thumbnailUrl || '')
-      : '';
-
-    const metadataFields: Partial<import('../../types').Gallery> = {
+    const newGallery: Gallery = {
       id: currentGalleryId,
       client,
       collectionTitle: collectionTitle || undefined,
-      coverPhotoUrl,
+      coverPhotoUrl: '',
+      downloadCode: `DIVA-${Math.floor(1000 + Math.random() * 9000)}`,
       includedPhotos,
       extraPhotoPrice,
       welcomeMessage: welcomeMessage || undefined,
       status: 'Draft' as const,
+      photos: localPhotos.map(p => ({
+        id: p.id,
+        url: p.url,
+        name: p.name,
+        size: p.size,
+        selectedByClient: false,
+        originalName: p.originalName,
+        mimeType: p.mimeType,
+        sizeBytes: p.sizeBytes,
+        width: p.width,
+        height: p.height,
+        duration: p.duration,
+        galleryId: p.galleryId,
+        thumbnailUrl: p.thumbnailUrl
+      })),
       selectedCount: 0,
       submittedAt: null,
       extraPhotosCount: 0,
       extraAmountDue: 0
     };
 
-    updateGalleryMetadata(currentGalleryId, metadataFields)
-      .then(() => {
-        setIsModalOpen(false);
-        clearActiveUploads();
-      })
+    // Start parallel upload in background
+    uploadAndAddGallery(newGallery, localFilesMap)
       .catch((err) => {
-        // Fallback: if Firestore write failed, ensure local state has the gallery
-        setFormError(`Gallery saved locally only (Firebase error: ${err.message || err})`);
-        setIsModalOpen(false);
-        clearActiveUploads();
+        console.error('[Background Upload Failed]:', err);
       });
+
+    // Close modal immediately and clear states
+    setIsModalOpen(false);
+    setLocalPhotos([]);
+    setLocalFilesMap(new Map());
+    setIsSaving(false);
   };
 
   const handleGenerateLink = (id: string) => {
@@ -299,7 +560,7 @@ export const Galleries: React.FC = () => {
         <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-6">
           {galleries.map((g) => {
             const coverUrl = g.coverPhotoUrl || (g.photos[0] ? g.photos[0].url : '/logo.png');
-            
+
             return (
               <div
                 key={g.id}
@@ -462,6 +723,38 @@ export const Galleries: React.FC = () => {
 
                 {/* Explorer Controls */}
                 <div className="space-y-3">
+                  {/* Download Code Card */}
+                  <div className="bg-slate-900 text-white rounded-2xl p-4 space-y-2.5 shadow-sm border border-slate-800">
+                    <div className="flex items-center justify-between">
+                      <div className="flex items-center gap-2">
+                        <Key className="w-4 h-4 text-brand-gold" />
+                        <span className="text-xs font-bold uppercase tracking-wider text-slate-300">Client Download Code</span>
+                      </div>
+                      <span className="text-[10px] bg-brand-gold/20 text-brand-gold font-mono font-bold px-2 py-0.5 rounded-md">
+                        UGX 5,000 / photo
+                      </span>
+                    </div>
+                    <div className="flex items-center justify-between bg-slate-800/80 p-2.5 rounded-xl border border-slate-700 font-mono text-sm tracking-widest text-brand-gold font-bold">
+                      <span>{activeGallery.downloadCode || 'DIVA-8492'}</span>
+                      <div className="flex items-center gap-1">
+                        <button
+                          onClick={() => copyToClipboard(activeGallery.downloadCode || 'DIVA-8492', `code-${activeGallery.id}`)}
+                          className="p-1.5 hover:bg-slate-700 rounded-lg text-slate-300 hover:text-white transition-colors"
+                          title="Copy Download Code"
+                        >
+                          {copiedId === `code-${activeGallery.id}` ? <Check className="w-4 h-4 text-emerald-400" /> : <Copy className="w-4 h-4" />}
+                        </button>
+                        <button
+                          onClick={() => handleRegenerateCode(activeGallery.id)}
+                          className="p-1.5 hover:bg-slate-700 rounded-lg text-slate-300 hover:text-amber-300 transition-colors"
+                          title="Regenerate Download Code"
+                        >
+                          <RefreshCw className="w-4 h-4" />
+                        </button>
+                      </div>
+                    </div>
+                  </div>
+
                   <h4 className="text-xs font-bold text-slate-400 uppercase tracking-wider mb-2">
                     Actions
                   </h4>
@@ -500,6 +793,29 @@ export const Galleries: React.FC = () => {
                       <Eye className="w-4 h-4" />
                       <span>Open Live Preview</span>
                     </a>
+                  )}
+
+                  {/* Export Selected Photos — Excel & PDF */}
+                  {activeGallery.selectedCount > 0 && (
+                    <div className="space-y-2">
+                      <p className="text-[10px] font-bold text-slate-400 uppercase tracking-wider">Export Selection List</p>
+                      <div className="grid grid-cols-2 gap-2">
+                        <button
+                          onClick={() => downloadSelectionAsExcel(activeGallery)}
+                          className="flex items-center justify-center gap-1.5 py-2 px-3 rounded-xl text-xs font-semibold bg-emerald-50 hover:bg-emerald-100 text-emerald-700 border border-emerald-200 transition-colors"
+                        >
+                          <FileDown className="w-3.5 h-3.5" />
+                          <span>Excel</span>
+                        </button>
+                        <button
+                          onClick={() => downloadSelectionAsPDF(activeGallery)}
+                          className="flex items-center justify-center gap-1.5 py-2 px-3 rounded-xl text-xs font-semibold bg-red-50 hover:bg-red-100 text-red-700 border border-red-200 transition-colors"
+                        >
+                          <FileText className="w-3.5 h-3.5" />
+                          <span>PDF</span>
+                        </button>
+                      </div>
+                    </div>
                   )}
 
                   {/* Reopen selections */}
@@ -615,37 +931,87 @@ export const Galleries: React.FC = () => {
                     </div>
                   ) : (
                     <div className="grid grid-cols-2 sm:grid-cols-3 gap-4">
-                      {getProcessedPhotos(activeGallery.photos).map((photo) => (
-                        <div
-                          key={photo.id}
-                          className={`group bg-slate-50 border rounded-2xl overflow-hidden relative select-none transition-all duration-200 ${
-                            photo.selectedByClient ? 'border-emerald-500/45 shadow-sm ring-1 ring-emerald-500/20' : 'border-slate-150'
-                          }`}
-                        >
-                          <div className="aspect-square bg-slate-900 overflow-hidden relative">
-                            <img
-                              src={photo.url}
-                              alt={photo.name}
-                              className="w-full h-full object-cover group-hover:scale-103 transition-transform duration-300"
-                              loading="lazy"
-                            />
-                            
-                            {/* Selected Check overlay */}
-                            {photo.selectedByClient && (
-                              <div className="absolute top-2 right-2 bg-emerald-500 text-white rounded-full p-1 shadow-md border border-white/20">
-                                <Check className="w-3.5 h-3.5 stroke-[3]" />
-                              </div>
-                            )}
-                          </div>
+                      {getProcessedPhotos(activeGallery.photos).map((photo) => {
+                        const statusInfo = uploadProgressMap[photo.id] || {
+                          progress: photo.url?.startsWith('http') ? 100 : 0,
+                          status: photo.url?.startsWith('http') ? 'completed' : 'uploading'
+                        };
+                        const isUploaded = photo.url && photo.url.startsWith('http');
+                        const isProcessing = statusInfo.status === 'processing';
+                        const progressPct = Math.min(100, Math.max(0, statusInfo.progress || 0));
 
-                          <div className="p-3 bg-white border-t border-slate-100 flex items-center justify-between text-[11px]">
-                            <span className="font-mono text-slate-500 truncate max-w-[120px]" title={photo.name}>
-                              {photo.name}
-                            </span>
-                            <span className="text-slate-400 font-medium">{photo.size}</span>
+                        return (
+                          <div
+                            key={photo.id}
+                            className={`group bg-slate-50 border rounded-2xl overflow-hidden relative select-none transition-all duration-200 ${
+                              photo.selectedByClient ? 'border-emerald-500/45 shadow-sm ring-1 ring-emerald-500/20' : 'border-slate-150'
+                            }`}
+                          >
+                            <div className="aspect-square bg-slate-900 overflow-hidden relative">
+                              <img
+                                src={photo.thumbnailUrl || photo.url}
+                                alt={photo.name}
+                                className="w-full h-full object-cover group-hover:scale-103 transition-transform duration-300"
+                                loading="lazy"
+                              />
+                              
+                              {/* Pixieset-style Circular Upload Progress / Processing Overlay */}
+                              {!isUploaded && (
+                                isProcessing ? (
+                                  <div className="absolute inset-0 bg-black/60 backdrop-blur-[2px] flex flex-col items-center justify-center gap-1 z-10">
+                                    <Loader2 className="w-6 h-6 animate-spin text-amber-400" />
+                                    <span className="text-[10px] font-bold text-amber-300 uppercase tracking-wider">Processing</span>
+                                  </div>
+                                ) : (
+                                  <div className="absolute inset-0 bg-black/60 backdrop-blur-[2px] flex flex-col items-center justify-center gap-1 z-10">
+                                    <div className="relative w-9 h-9 flex items-center justify-center">
+                                      <svg className="w-full h-full transform -rotate-90" viewBox="0 0 36 36">
+                                        <path
+                                          className="text-white/20"
+                                          strokeWidth="3.5"
+                                          stroke="currentColor"
+                                          fill="none"
+                                          d="M18 2.0845 a 15.9155 15.9155 0 0 1 0 31.831 a 15.9155 15.9155 0 0 1 0 -31.831"
+                                        />
+                                        <path
+                                          className="text-brand-blue"
+                                          strokeDasharray={`${progressPct}, 100`}
+                                          strokeWidth="3.5"
+                                          strokeLinecap="round"
+                                          stroke="currentColor"
+                                          fill="none"
+                                          d="M18 2.0845 a 15.9155 15.9155 0 0 1 0 31.831 a 15.9155 15.9155 0 0 1 0 -31.831"
+                                        />
+                                      </svg>
+                                      <span className="absolute text-[9px] font-extrabold text-white">{progressPct}%</span>
+                                    </div>
+                                  </div>
+                                )
+                              )}
+
+                              {isUploaded && (
+                                <div className="absolute top-2 left-2 bg-emerald-500/90 text-white rounded-full p-1 flex items-center shadow-md backdrop-blur-sm" title="Uploaded to Cloud Storage">
+                                  <CheckCircle className="w-3.5 h-3.5 text-white" />
+                                </div>
+                              )}
+
+                              {/* Selected Check overlay */}
+                              {photo.selectedByClient && (
+                                <div className="absolute top-2 right-2 bg-emerald-500 text-white rounded-full p-1 shadow-md border border-white/20">
+                                  <Check className="w-3.5 h-3.5 stroke-[3]" />
+                                </div>
+                              )}
+                            </div>
+
+                            <div className="p-3 bg-white border-t border-slate-100 flex items-center justify-between text-[11px]">
+                              <span className="font-mono text-slate-500 truncate max-w-[120px]" title={photo.name}>
+                                {photo.name}
+                              </span>
+                              <span className="text-slate-400 font-medium">{photo.size}</span>
+                            </div>
                           </div>
-                        </div>
-                      ))}
+                        );
+                      })}
                     </div>
                   )}
                 </div>
@@ -661,13 +1027,14 @@ export const Galleries: React.FC = () => {
       {/* Add Gallery Modal */}
       {isModalOpen && (
         <div className="fixed inset-0 bg-slate-900/50 backdrop-blur-sm z-50 flex items-center justify-center p-4">
-          <div className="w-full max-w-lg bg-white rounded-3xl shadow-xl border border-slate-100 overflow-hidden animate-scale-up">
+          <div className="w-full max-w-lg bg-white rounded-3xl shadow-xl border border-slate-100 overflow-hidden animate-scale-up relative">
+
             <div className="flex justify-between items-center px-6 py-5 border-b border-slate-100">
               <h3 className="font-display font-bold text-lg text-slate-800">
                 Create Selection Gallery
               </h3>
               <button
-                onClick={() => setIsModalOpen(false)}
+                onClick={handleCancelModal}
                 className="text-slate-400 hover:text-slate-600 bg-slate-50 hover:bg-slate-100 p-1.5 rounded-lg transition-colors"
               >
                 <X className="w-4 h-4" />
@@ -709,8 +1076,6 @@ export const Galleries: React.FC = () => {
                   className="w-full px-4 py-2.5 bg-slate-50 border border-slate-200 focus:border-brand-blue rounded-xl text-sm placeholder-slate-400 focus:outline-none transition-colors"
                 />
               </div>
-
-
 
               {/* Included and Overage pricing inputs in 2 columns */}
               <div className="grid grid-cols-2 gap-4">
@@ -756,10 +1121,10 @@ export const Galleries: React.FC = () => {
                 />
               </div>
 
-              {/* Simulated Image Upload */}
+              {/* Image Selection */}
               <div>
                 <label className="block text-xs font-semibold text-slate-500 uppercase tracking-wider mb-1.5">
-                  Upload Photos
+                  Select Photos
                 </label>
 
                 {/* Hidden File Input */}
@@ -772,72 +1137,146 @@ export const Galleries: React.FC = () => {
                   className="hidden"
                 />
 
-                {uploadedPhotos.length > 0 ? (
+                {localPhotos.length > 0 ? (
                   <div className="space-y-3">
-                    <div className="bg-slate-50 p-4 rounded-2xl border border-slate-200 flex items-center justify-between">
-                      <div className="flex items-center gap-3">
-                        <div className="p-2 bg-emerald-50 text-emerald-600 rounded-lg">
-                          <CheckCircle className="w-5 h-5" />
-                        </div>
-                        <div>
-                          <div className="text-sm font-semibold text-slate-800">
-                            {uploadedPhotos.length} photos ready
-                          </div>
-                          <div className="text-[10px] text-slate-500 font-medium">
-                            Device file gallery loaded successfully
-                          </div>
-                        </div>
-                      </div>
-                      <div className="flex gap-2">
-                        <button
-                          type="button"
-                          onClick={triggerFileInput}
-                          className="text-xs text-brand-blue hover:text-brand-blue-dark font-semibold bg-white border border-slate-200 py-1.5 px-3 rounded-lg transition-colors"
-                        >
-                          Add More
-                        </button>
-                        <button
-                          type="button"
-                          onClick={clearActiveUploads}
-                          className="text-xs text-slate-400 hover:text-red-500 font-semibold bg-white border border-slate-200 hover:border-red-100 py-1.5 px-3 rounded-lg transition-colors"
-                        >
-                          Clear All
-                        </button>
-                      </div>
-                    </div>
+                    {(() => {
+                      const uploadedCount = localPhotos.filter((p) => p.url && p.url.startsWith('http')).length;
+                      const isAllUploaded = localPhotos.length > 0 && uploadedCount === localPhotos.length;
+                      const overallPct = Math.round((uploadedCount / localPhotos.length) * 100);
 
-                    {/* Previews Strip */}
-                    <div className="flex gap-2 overflow-x-auto py-1 scrollbar-none max-w-full">
-                      {uploadedPhotos.map((photo) => {
-                        const uploadStatus = queueForGallery.find((item) => item.id === photo.id);
-                        return (
-                          <div key={photo.id} className="relative w-12 h-12 rounded-lg overflow-hidden shrink-0 border border-slate-200 bg-slate-950">
-                            <img src={photo.url} alt="" className="w-full h-full object-cover" />
-                            {uploadStatus && (uploadStatus.status === 'uploading' || uploadStatus.status === 'waiting' || uploadStatus.status === 'processing') && (
-                              <div className="absolute inset-0 bg-black/65 flex flex-col items-center justify-center text-[9px] font-bold text-white leading-tight">
-                                {uploadStatus.status === 'waiting' ? (
-                                  <span>Wait</span>
-                                ) : uploadStatus.status === 'processing' ? (
-                                  <span className="animate-pulse">Proc</span>
+                      return (
+                        <div className={`p-4 rounded-2xl border transition-all ${
+                          isAllUploaded
+                            ? 'bg-emerald-50/80 border-emerald-200'
+                            : 'bg-blue-50/80 border-blue-200'
+                        }`}>
+                          <div className="flex items-center justify-between">
+                            <div className="flex items-center gap-3">
+                              <div className={`p-2 rounded-xl ${
+                                isAllUploaded ? 'bg-emerald-500 text-white' : 'bg-brand-blue text-white animate-pulse'
+                              }`}>
+                                {isAllUploaded ? (
+                                  <CheckCircle className="w-5 h-5" />
                                 ) : (
-                                  <span>{uploadStatus.progress}%</span>
+                                  <Loader2 className="w-5 h-5 animate-spin" />
                                 )}
                               </div>
+                              <div>
+                                <div className="text-xs font-bold text-slate-800 flex items-center gap-2">
+                                  {isAllUploaded ? (
+                                    <span className="text-emerald-900">All {localPhotos.length} photos uploaded to Cloudinary</span>
+                                  ) : (
+                                    <span className="text-blue-900">Uploading to Cloudinary: {uploadedCount} of {localPhotos.length} complete ({overallPct}%)</span>
+                                  )}
+                                </div>
+                                <div className="text-[11px] text-slate-600 font-medium">
+                                  {isAllUploaded
+                                    ? 'All image URLs & metadata confirmed. Ready to save gallery.'
+                                    : 'Please wait for uploads to complete before saving.'}
+                                </div>
+                              </div>
+                            </div>
+                            <div className="flex gap-2">
+                              <button
+                                type="button"
+                                onClick={triggerFileInput}
+                                className="text-xs text-brand-blue hover:text-brand-blue-dark font-semibold bg-white border border-slate-200 py-1.5 px-3 rounded-xl transition-colors shadow-sm"
+                              >
+                                Add More
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() => {
+                                  localPhotos.forEach((p) => {
+                                    if (p.url.startsWith('blob:')) URL.revokeObjectURL(p.url);
+                                  });
+                                  setLocalPhotos([]);
+                                  setLocalFilesMap(new Map());
+                                }}
+                                className="text-xs text-slate-400 hover:text-red-500 font-semibold bg-white border border-slate-200 hover:border-red-100 py-1.5 px-3 rounded-xl transition-colors shadow-sm"
+                              >
+                                Clear All
+                              </button>
+                            </div>
+                          </div>
+
+                          {!isAllUploaded && (
+                            <div className="w-full bg-blue-200/60 h-2 rounded-full overflow-hidden mt-3">
+                              <div
+                                className="bg-brand-blue h-full rounded-full transition-all duration-300"
+                                style={{ width: `${overallPct}%` }}
+                              />
+                            </div>
+                          )}
+                        </div>
+                      );
+                    })()}
+
+                    {/* Previews Strip */}
+                    <div className="flex gap-2.5 overflow-x-auto py-2 scrollbar-none max-w-full">
+                      {localPhotos.map((photo) => {
+                        const statusInfo = uploadProgressMap[photo.id] || {
+                          progress: photo.url?.startsWith('http') ? 100 : 0,
+                          status: photo.url?.startsWith('http') ? 'completed' : 'uploading'
+                        };
+                        const isUploaded = photo.url && photo.url.startsWith('http');
+                        const isCompressing = statusInfo.status === 'compressing';
+                        const isProcessing = statusInfo.status === 'processing';
+                        const progressPct = Math.min(100, Math.max(0, statusInfo.progress || 0));
+
+                        return (
+                          <div key={photo.id} className="relative w-16 h-16 rounded-2xl overflow-hidden shrink-0 border border-slate-200 bg-slate-950 shadow-sm group">
+                            <img src={photo.thumbnailUrl || photo.url} alt="" className="w-full h-full object-cover" />
+                            
+                            {/* Overlay Statuses */}
+                            {!isUploaded && (
+                              isCompressing ? (
+                                <div className="absolute inset-0 bg-black/60 backdrop-blur-[1px] flex flex-col items-center justify-center pointer-events-none z-10 text-amber-300">
+                                  <Loader2 className="w-4 h-4 animate-spin mb-0.5" />
+                                  <span className="text-[7px] font-bold">Optimizing</span>
+                                </div>
+                              ) : isProcessing ? (
+                                <div className="absolute inset-0 bg-black/60 backdrop-blur-[1px] flex flex-col items-center justify-center pointer-events-none z-10 text-purple-300">
+                                  <Loader2 className="w-4 h-4 animate-spin mb-0.5" />
+                                  <span className="text-[7px] font-bold">Processing</span>
+                                </div>
+                              ) : (
+                                <div className="absolute inset-0 bg-black/60 backdrop-blur-[1px] flex items-center justify-center pointer-events-none z-10">
+                                  <div className="relative w-8 h-8 flex items-center justify-center">
+                                    <svg className="w-full h-full transform -rotate-90" viewBox="0 0 36 36">
+                                      <path
+                                        className="text-white/20"
+                                        strokeWidth="4"
+                                        stroke="currentColor"
+                                        fill="none"
+                                        d="M18 2.0845 a 15.9155 15.9155 0 0 1 0 31.831 a 15.9155 15.9155 0 0 1 0 -31.831"
+                                      />
+                                      <path
+                                        className="text-brand-blue"
+                                        strokeDasharray={`${progressPct}, 100`}
+                                        strokeWidth="4"
+                                        strokeLinecap="round"
+                                        stroke="currentColor"
+                                        fill="none"
+                                        d="M18 2.0845 a 15.9155 15.9155 0 0 1 0 31.831 a 15.9155 15.9155 0 0 1 0 -31.831"
+                                      />
+                                    </svg>
+                                    <span className="absolute text-[8px] font-extrabold text-white">{progressPct}%</span>
+                                  </div>
+                                </div>
+                              )
                             )}
-                            {uploadStatus && uploadStatus.status === 'completed' && (
-                              <div className="absolute top-0.5 left-0.5 bg-emerald-500 text-white rounded-full p-0.5 shadow z-10">
-                                <Check className="w-2.5 h-2.5 stroke-[3]" />
+
+                            {isUploaded && (
+                              <div className="absolute bottom-1 right-1 bg-emerald-500 text-white rounded-full p-0.5 shadow z-10">
+                                <CheckCircle className="w-3.5 h-3.5 text-white" />
                               </div>
                             )}
-                            {uploadStatus && uploadStatus.status === 'failed' && (
-                              <div className="absolute inset-0 bg-red-650/80 flex items-center justify-center text-[9px] font-bold text-white">
-                                Fail
-                              </div>
-                            )}
+
                             <button
                               type="button"
-                              onClick={() => cancelUpload(photo.id)}
-                              className="absolute -top-1 -right-1 bg-black/75 hover:bg-red-500 text-white rounded-full p-0.5 z-10 shadow"
+                              onClick={() => handleRemovePhoto(photo.id)}
+                              className="absolute -top-1 -right-1 bg-black/80 hover:bg-red-500 text-white rounded-full p-0.5 z-20 shadow transition-colors"
                             >
                               <X className="w-3 h-3" />
                             </button>
@@ -864,7 +1303,7 @@ export const Galleries: React.FC = () => {
                       <div className="text-sm font-bold text-slate-700">
                         {isDragActive ? 'Drop your photos here!' : 'Drag files here or click to upload'}
                       </div>
-                      <p className="text-xs text-slate-400 font-medium">
+                      <p className="text-xs text-slate-450 font-medium">
                         Supports JPEG, PNG, WEBP from your local device
                       </p>
                     </div>
@@ -876,20 +1315,22 @@ export const Galleries: React.FC = () => {
               <div className="flex gap-3 pt-4 border-t border-slate-100">
                 <button
                   type="button"
-                  onClick={() => setIsModalOpen(false)}
+                  onClick={handleCancelModal}
                   className="flex-1 bg-slate-100 hover:bg-slate-200 text-slate-700 font-semibold py-2.5 px-4 rounded-xl text-sm transition-colors"
                 >
                   Cancel
                 </button>
                 <button
                   type="submit"
-                  disabled={syncing || queueForGallery.some(item => item.status === 'uploading' || item.status === 'waiting' || item.status === 'processing')}
-                  className="flex-1 bg-brand-blue hover:bg-brand-blue-dark disabled:bg-slate-300 disabled:cursor-not-allowed text-white font-semibold py-2.5 px-4 rounded-xl text-sm transition-colors shadow-md shadow-brand-blue/10 flex items-center justify-center gap-2"
+                  disabled={isSaving}
+                  className="flex-1 bg-brand-blue hover:bg-brand-blue-dark disabled:bg-slate-350 disabled:cursor-not-allowed text-white font-semibold py-2.5 px-4 rounded-xl text-sm transition-colors shadow-md shadow-brand-blue/10 flex items-center justify-center gap-2"
                 >
-                  {syncing ? (
+                  {isSaving ? (
+                    'Saving...'
+                  ) : localPhotos.length > 0 && localPhotos.filter((p) => p.url && p.url.startsWith('http')).length < localPhotos.length ? (
                     <>
-                      <span className="animate-spin rounded-full h-4 w-4 border-2 border-white border-t-transparent" />
-                      Saving...
+                      <Loader2 className="w-4 h-4 animate-spin text-white" />
+                      <span>Uploading ({localPhotos.filter((p) => p.url && p.url.startsWith('http')).length}/{localPhotos.length})...</span>
                     </>
                   ) : (
                     'Save Gallery'

@@ -12,7 +12,6 @@ import {
   Menu,
   X
 } from 'lucide-react';
-import { UploadManager } from './UploadManager';
 
 interface AdminLayoutProps {
   children: React.ReactNode;
@@ -165,7 +164,7 @@ export const AdminLayout: React.FC<AdminLayoutProps> = ({ children }) => {
       </aside>
 
       {/* Main Content Area */}
-      <main className="flex-1 p-4 sm:p-6 md:p-10 max-w-7xl mx-auto w-full transition-all duration-300 overflow-y-auto pb-24 md:pb-10">
+      <main className="flex-1 p-4 sm:p-6 md:p-10 max-w-7xl mx-auto w-full transition-all duration-300 overflow-y-auto pb-8 md:pb-10">
         {children}
       </main>
 
@@ -176,32 +175,6 @@ export const AdminLayout: React.FC<AdminLayoutProps> = ({ children }) => {
           className="fixed inset-0 bg-black/50 z-10 md:hidden transition-opacity duration-300"
         />
       )}
-
-      {/* Mobile Bottom Navigation Bar */}
-      <nav className="md:hidden fixed bottom-0 inset-x-0 bg-slate-900 border-t border-slate-800 z-20 flex items-center justify-around pb-safe">
-        {navItems.slice(0, 5).map((item) => {
-          const Icon = item.icon;
-          const isActive = location.pathname === item.path || (item.path === '/admin/dashboard' && location.pathname === '/admin');
-          return (
-            <Link
-              key={item.name}
-              to={item.path}
-              className={`relative flex flex-col items-center gap-0.5 py-2.5 px-3 flex-1 transition-colors ${
-                isActive ? 'text-brand-gold' : 'text-slate-500 hover:text-slate-300'
-              }`}
-            >
-              <Icon className="w-5 h-5" />
-              <span className="text-[9px] font-bold uppercase tracking-wider">{item.name}</span>
-              {item.badge !== undefined && (
-                <span className="absolute top-1.5 right-2.5 bg-red-500 text-white text-[8px] font-bold w-4 h-4 rounded-full flex items-center justify-center">
-                  {item.badge > 9 ? '9+' : item.badge}
-                </span>
-              )}
-            </Link>
-          );
-        })}
-      </nav>      {/* Google Drive-like Floating Upload Panel */}
-      <UploadManager />
     </div>
   );
 };

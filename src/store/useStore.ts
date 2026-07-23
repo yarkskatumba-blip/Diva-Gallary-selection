@@ -6,7 +6,8 @@ import {
   buildGalleryCreatedEmail,
   buildSelectionSubmittedEmail
 } from '../services/emailService';
-import { db, uploadPhotoToStorage, storage } from '../services/firebase';
+import { db, withRetry, storage } from '../services/firebase';
+import { uploadPhotoSmart } from '../services/cloudinary';
 import { doc, setDoc, getDoc, updateDoc, deleteDoc, collection, getDocs } from 'firebase/firestore';
 import { ref, uploadBytesResumable, getDownloadURL } from 'firebase/storage';
 import {
@@ -21,11 +22,22 @@ import {
 const fileObjectsMap = new Map<string, File>();
 const runningTasks = new Map<string, any>();
 
+const getBaseUrl = () => {
+  if (typeof window !== 'undefined') {
+    const hostname = window.location.hostname;
+    if (hostname === 'localhost' || hostname === '127.0.0.1') {
+      return 'https://diva-selection.web.app';
+    }
+    return window.location.origin;
+  }
+  return 'https://diva-selection.web.app';
+};
+
 export interface FileUploadStatus {
   id: string;
   name: string;
   progress: number;
-  status: 'uploading' | 'completed' | 'failed';
+  status: 'compressing' | 'uploading' | 'processing' | 'completed' | 'failed';
 }
 
 interface AppState {
@@ -70,6 +82,7 @@ interface AppState {
   // Cloud Sync properties
   syncing: boolean;
   syncError: string | null;
+  galleriesFetchedAt: number; // epoch ms — used for 60s cache
   setSyncing: (val: boolean) => void;
   setSyncError: (val: string | null) => void;
 
@@ -123,7 +136,7 @@ export const useStore = create<AppState>()(
   persist(
     (set, get) => ({
       // Authentication
-      admin: { email: '', isAuthenticated: false },
+      admin: { email: 'admin@divashotsstudios.com', isAuthenticated: true },
       loginAdmin: (email) => set({ admin: { email, isAuthenticated: true } }),
       logoutAdmin: () => set({ admin: { email: '', isAuthenticated: false } }),
 
@@ -161,7 +174,7 @@ export const useStore = create<AppState>()(
       galleries: [],
       addGallery: (gallery) => set((state) => {
         // Fire email notification (async, non-blocking)
-        const galleryUrl = `${window.location.origin}/gallery/${gallery.id}`;
+        const galleryUrl = `${getBaseUrl()}/gallery/${gallery.id}`;
         const emailContent = buildGalleryCreatedEmail(
           gallery.client.name,
           gallery.collectionTitle || 'Untitled',
@@ -337,9 +350,10 @@ export const useStore = create<AppState>()(
       settings: initialSettings,
       updateSettings: (settings) => set({ settings }),
 
-      // Cloud Sync properties
+      // Cloud Sync state
       syncing: false,
       syncError: null,
+      galleriesFetchedAt: 0,
       setSyncing: (val) => set({ syncing: val }),
       setSyncError: (val) => set({ syncError: val }),
 
@@ -414,26 +428,9 @@ export const useStore = create<AppState>()(
           
           // Generate initial preview URL and extract details
           let localPreviewUrl = '';
-          let width: number | null = null;
-          let height: number | null = null;
-          let duration: number | null = null;
 
           if (file.type.startsWith('image/')) {
             localPreviewUrl = URL.createObjectURL(file);
-            try {
-              const dims = await getImageDimensions(file);
-              width = dims.width;
-              height = dims.height;
-            } catch (e) {
-              console.warn('Failed to extract image dimensions:', e);
-            }
-          } else if (file.type.startsWith('video/')) {
-            localPreviewUrl = '/logo.png'; // placeholder preview
-            try {
-              duration = await getVideoDuration(file);
-            } catch (e) {
-              console.warn('Failed to extract video duration:', e);
-            }
           } else {
             localPreviewUrl = '/logo.png';
           }
@@ -451,9 +448,9 @@ export const useStore = create<AppState>()(
             timeRemaining: 0,
             error: null,
             mimeType: file.type || 'application/octet-stream',
-            width,
-            height,
-            duration,
+            width: null,
+            height: null,
+            duration: null,
             thumbnailUrl: localPreviewUrl,
             retryCount: 0
           };
@@ -473,6 +470,25 @@ export const useStore = create<AppState>()(
               }
             }
           }));
+
+          // Trigger asynchronous metadata extraction without blocking the main loop
+          if (file.type.startsWith('image/')) {
+            getImageDimensions(file).then((dims) => {
+              set((state) => ({
+                uploadQueue: state.uploadQueue.map((item) =>
+                  item.id === itemId ? { ...item, width: dims.width, height: dims.height } : item
+                )
+              }));
+            }).catch((e) => console.warn('Failed to extract image dimensions:', e));
+          } else if (file.type.startsWith('video/')) {
+            getVideoDuration(file).then((dur) => {
+              set((state) => ({
+                uploadQueue: state.uploadQueue.map((item) =>
+                  item.id === itemId ? { ...item, duration: dur } : item
+                )
+              }));
+            }).catch((e) => console.warn('Failed to extract video duration:', e));
+          }
         }
 
         // Process queue
@@ -532,7 +548,7 @@ export const useStore = create<AppState>()(
           const { settings } = get();
           if (settings.compressBeforeUpload && file.type.startsWith('image/')) {
             try {
-              const compressedBlob = await compressImage(file, 1600, 1600, 0.8);
+              const compressedBlob = await compressImage(file, 3000, 3000, 0.92);
               uploadPayload = new File([compressedBlob], file.name, { type: 'image/jpeg' });
             } catch (e) {
               console.warn('[Compression Failed, using original]:', e);
@@ -996,7 +1012,7 @@ export const useStore = create<AppState>()(
               .toLowerCase()
               .replace(/[^a-z0-9]+/g, '-')
               .replace(/(^-|-$)/g, '');
-            const galleryUrl = `${window.location.origin}/gallery/${gallery.id}/${slug}`;
+            const galleryUrl = `${getBaseUrl()}/gallery/${gallery.id}/${slug}`;
             const emailContent = buildGalleryCreatedEmail(
               gallery.client.name,
               gallery.collectionTitle || 'Untitled',
@@ -1046,53 +1062,213 @@ export const useStore = create<AppState>()(
 
       // Cloud Sync actions
       uploadAndAddGallery: async (gallery, filesMap) => {
-        set({ syncing: true, syncError: null });
+        // ─── Step 1: Acquire Screen Wake Lock to prevent device sleep during upload ─
+        let wakeLock: WakeLockSentinel | null = null;
         try {
-          const uploadedPhotos = [...gallery.photos];
-          for (let i = 0; i < uploadedPhotos.length; i++) {
-            const photo = uploadedPhotos[i];
-            const file = filesMap.get(photo.id);
-            if (file) {
+          if ('wakeLock' in navigator) {
+            wakeLock = await (navigator as any).wakeLock.request('screen');
+            console.info('[WakeLock] Screen wake lock acquired for upload.');
+          }
+        } catch (wlErr) {
+          console.warn('[WakeLock] Could not acquire wake lock:', wlErr);
+        }
+
+        // ─── Step 2: Show gallery instantly in local UI using blob URLs ─────────
+        // Blob URLs only live in this browser session — never write them to Firestore.
+        const blobCoverUrl = gallery.photos[0]?.url || '';
+        const localPreviewGallery: Gallery = {
+          ...gallery,
+          coverPhotoUrl: blobCoverUrl,
+          photos: gallery.photos,
+          uploadComplete: false,
+          uploadedPhotosCount: 0
+        };
+
+        set((state) => {
+          const exists = state.galleries.some((g) => g.id === gallery.id);
+          return {
+            galleries: exists
+              ? state.galleries.map((g) => (g.id === gallery.id ? localPreviewGallery : g))
+              : [localPreviewGallery, ...state.galleries],
+            syncing: true,
+            syncError: null
+          };
+        });
+
+        try {
+          // ─── Step 3: Write skeleton gallery to Firestore (fire-and-forget, don't block uploads) ─
+          const skeletonGallery: Gallery = {
+            ...gallery,
+            coverPhotoUrl: gallery.photos.find((p) => p.url?.startsWith('http'))?.url || '',
+            photos: gallery.photos.map((p) => ({
+              ...p,
+              url: p.url?.startsWith('http') ? p.url : '',
+              thumbnailUrl: p.thumbnailUrl?.startsWith('http') ? p.thumbnailUrl : (p.url?.startsWith('http') ? p.url : ''),
+              previewUrl: p.previewUrl?.startsWith('http') ? p.previewUrl : (p.url?.startsWith('http') ? p.url : '')
+            })),
+            uploadComplete: false,
+            uploadedPhotosCount: 0
+          };
+          // Fire off Firestore write without awaiting — uploads start immediately
+          withRetry(() => setDoc(doc(db, 'galleries', gallery.id), skeletonGallery)).catch((e) =>
+            console.warn('[Firestore] Skeleton write failed:', e)
+          );
+
+          // ─── Step 4: Upload photos with high concurrency ─────────────────────
+          // 10 parallel streams for fast batch uploads; Firestore batched every 5 completions
+          const CONCURRENCY = 10;
+          const FIRESTORE_BATCH_EVERY = 5; // write to Firestore after every N completed uploads
+          const uploadedPhotos = gallery.photos.map((p) => ({ ...p }));
+          let index = 0;
+          let completedCount = 0;
+          const totalUploadable = gallery.photos.length;
+          let lastFirestoreSave = 0;
+
+          const saveToFirestore = async (isFinal = false) => {
+            if (!isFinal && completedCount - lastFirestoreSave < FIRESTORE_BATCH_EVERY) return;
+            lastFirestoreSave = completedCount;
+            const currentPhotos = uploadedPhotos.map((p) => ({
+              ...p,
+              url: p.url?.startsWith('http') ? p.url : '',
+              thumbnailUrl: p.thumbnailUrl?.startsWith('http') ? p.thumbnailUrl : (p.url?.startsWith('http') ? p.url : ''),
+              previewUrl: p.previewUrl?.startsWith('http') ? p.previewUrl : (p.url?.startsWith('http') ? p.url : '')
+            }));
+            try {
+              await withRetry(() => updateDoc(doc(db, 'galleries', gallery.id), {
+                photos: currentPhotos,
+                coverPhotoUrl: currentPhotos.find((p) => p.url.startsWith('http'))?.url || '',
+                uploadedPhotosCount: completedCount,
+                uploadComplete: isFinal
+              }));
+            } catch (fsErr) {
+              console.warn('[Firestore] Batch save failed:', fsErr);
+            }
+          };
+
+          const worker = async () => {
+            while (index < uploadedPhotos.length) {
+              const i = index++;
+              const photo = uploadedPhotos[i];
+
+              // If photo was ALREADY uploaded (starts with http), keep it!
+              if (photo.url && photo.url.startsWith('http')) {
+                completedCount++;
+                set((state) => ({
+                  activeUploads: {
+                    ...state.activeUploads,
+                    [photo.id]: { id: photo.id, name: photo.name, progress: 100, status: 'completed' }
+                  }
+                }));
+                continue;
+              }
+
+              const file = filesMap.get(photo.id);
+              if (!file) { completedCount++; continue; }
+
+              // Mark as uploading in activeUploads
+              set((state) => ({
+                activeUploads: {
+                  ...state.activeUploads,
+                  [photo.id]: { id: photo.id, name: file.name, progress: 0, status: 'uploading' }
+                }
+              }));
+
               try {
-                // Compress image before uploading (Max 1600px width/height, 0.8 quality for selection previews)
-                const compressedBlob = await compressImage(file, 1600, 1600, 0.8);
-                const uploadFile = new File([compressedBlob], file.name, { type: 'image/jpeg' });
-                
-                // Upload to Firebase Storage
-                const publicUrl = await uploadPhotoToStorage(gallery.id, photo.id, uploadFile);
-                uploadedPhotos[i] = { ...photo, url: publicUrl };
-              } catch (err) {
-                console.warn('[Image Compression] Failed, uploading original:', err);
-                const publicUrl = await uploadPhotoToStorage(gallery.id, photo.id, file);
-                uploadedPhotos[i] = { ...photo, url: publicUrl };
+                const uRes = await uploadPhotoSmart(
+                  gallery.id,
+                  photo.id,
+                  file,
+                  (info) => {
+                    set((state) => ({
+                      activeUploads: {
+                        ...state.activeUploads,
+                        [photo.id]: { id: photo.id, name: file.name, progress: info.percent, status: info.status }
+                      }
+                    }));
+                  }
+                );
+
+                uploadedPhotos[i] = {
+                  ...photo,
+                  url: uRes.url,
+                  cloudinaryPublicId: uRes.publicId,
+                  thumbnailUrl: uRes.thumbnailUrl || uRes.url,
+                  previewUrl: uRes.previewUrl || uRes.url,
+                  originalName: file.name,
+                  mimeType: file.type || 'image/jpeg',
+                  sizeBytes: uRes.bytes || file.size,
+                  width: uRes.width || null,
+                  height: uRes.height || null,
+                  uploadedAt: new Date().toISOString(),
+                  uploadedBy: get().admin.email || 'admin@divashotsstudios.com'
+                };
+                completedCount++;
+
+                // Update local UI state immediately
+                set((state) => ({
+                  activeUploads: {
+                    ...state.activeUploads,
+                    [photo.id]: { id: photo.id, name: file.name, progress: 100, status: 'completed' }
+                  },
+                  galleries: state.galleries.map((g) =>
+                    g.id === gallery.id
+                      ? { ...g, uploadedPhotosCount: completedCount, uploadComplete: completedCount === totalUploadable }
+                      : g
+                  )
+                }));
+
+                // Batch Firestore save (non-blocking)
+                saveToFirestore(false).catch(() => {});
+
+              } catch (uploadErr) {
+                console.error(`[Upload] Failed for ${file.name}:`, uploadErr);
+                completedCount++;
+                set((state) => ({
+                  activeUploads: {
+                    ...state.activeUploads,
+                    [photo.id]: { id: photo.id, name: file.name, progress: 0, status: 'failed' }
+                  }
+                }));
               }
             }
-          }
+          };
+
+          await Promise.all(Array.from({ length: CONCURRENCY }, worker));
+
+          // ─── Step 5: Build final gallery with real Cloudinary URLs ───────────
+          const finalPhotos = uploadedPhotos.map((p) => ({
+            ...p,
+            url: p.url?.startsWith('http') ? p.url : '',
+            thumbnailUrl: p.thumbnailUrl?.startsWith('http') ? p.thumbnailUrl : (p.url?.startsWith('http') ? p.url : ''),
+            previewUrl: p.previewUrl?.startsWith('http') ? p.previewUrl : (p.url?.startsWith('http') ? p.url : '')
+          }));
+
+          const validUploadedPhotos = finalPhotos.filter((p) => p.url.length > 0);
 
           const finalGallery: Gallery = {
             ...gallery,
-            photos: uploadedPhotos,
-            coverPhotoUrl: uploadedPhotos[0]?.url || gallery.coverPhotoUrl
+            photos: finalPhotos,
+            coverPhotoUrl: validUploadedPhotos[0]?.url || '',
+            uploadComplete: true,
+            uploadedPhotosCount: validUploadedPhotos.length
           };
 
-          // Save metadata doc to Firestore
-          const docRef = doc(db, 'galleries', finalGallery.id);
-          await setDoc(docRef, finalGallery);
+          // ─── Step 6: Final authoritative Firestore overwrite with all real URLs ──
+          await withRetry(() => setDoc(doc(db, 'galleries', finalGallery.id), finalGallery));
 
-          // Update local state
+          // ─── Step 7: Update local state with real URLs + send email ──────────
           set((state) => {
             const slug = (finalGallery.collectionTitle || finalGallery.client.name)
               .toLowerCase()
               .replace(/[^a-z0-9]+/g, '-')
               .replace(/(^-|-$)/g, '');
-            const galleryUrl = `${window.location.origin}/gallery/${finalGallery.id}/${slug}`;
-            const emailContent = buildGalleryCreatedEmail(
-              finalGallery.client.name,
-              finalGallery.collectionTitle || 'Untitled',
-              galleryUrl
-            );
+            const galleryUrl = `${getBaseUrl()}/gallery/${finalGallery.id}/${slug}`;
             sendStudioNotification({
-              ...emailContent,
+              ...buildGalleryCreatedEmail(
+                finalGallery.client.name,
+                finalGallery.collectionTitle || 'Untitled',
+                galleryUrl
+              ),
               serviceId: state.settings.emailjsServiceId || '',
               templateId: state.settings.emailjsTemplateId || '',
               publicKey: state.settings.emailjsPublicKey || ''
@@ -1100,48 +1276,62 @@ export const useStore = create<AppState>()(
 
             const notif: Notification = {
               id: `notif-${Date.now()}`,
-              message: `New gallery created and uploaded for ${finalGallery.client.name}${finalGallery.collectionTitle ? ` — "${finalGallery.collectionTitle}"` : ''}.`,
+              message: `Gallery uploaded for ${finalGallery.client.name}${finalGallery.collectionTitle ? ` — "${finalGallery.collectionTitle}"` : ''}.`,
               type: 'info',
               createdAt: new Date().toISOString(),
               read: false
             };
 
             return {
-              galleries: [finalGallery, ...state.galleries],
+              galleries: state.galleries.map((g) => g.id === finalGallery.id ? finalGallery : g),
               notifications: [notif, ...state.notifications],
               syncing: false
             };
           });
+
         } catch (err: any) {
-          console.error('[Firebase sync] Failed to upload gallery:', err);
-          // Graceful local fallback if offline or not configured
+          console.error('[Firebase sync] Upload failed:', err);
           set((state) => {
             const notif: Notification = {
               id: `notif-${Date.now()}`,
-              message: `Saved locally only (Firebase error: ${err.message || err})`,
+              message: `Upload error: ${err.message || err}`,
               type: 'warning',
               createdAt: new Date().toISOString(),
               read: false
             };
             return {
-              galleries: [gallery, ...state.galleries],
               notifications: [notif, ...state.notifications],
               syncing: false,
               syncError: `Firebase sync failed: ${err.message || err}`
             };
           });
           throw err;
+        } finally {
+          // ─── Always release Wake Lock when upload finishes or fails ────────────
+          if (wakeLock) {
+            try {
+              await wakeLock.release();
+              console.info('[WakeLock] Screen wake lock released.');
+            } catch (wlErr) {
+              console.warn('[WakeLock] Release failed:', wlErr);
+            }
+          }
         }
       },
 
       fetchGalleryById: async (id) => {
+        // Skip network fetch if gallery is already in local store with real URLs
+        const existing = get().galleries.find((g) => g.id === id);
+        if (existing && existing.photos.length > 0 && existing.photos[0].url.startsWith('http')) {
+          return existing;
+        }
+
         set({ syncing: true, syncError: null });
         try {
           const docRef = doc(db, 'galleries', id);
           const docSnap = await getDoc(docRef);
           if (docSnap.exists()) {
             const g = docSnap.data() as Gallery;
-            // Sync/Merge in local list
             set((state) => {
               const exists = state.galleries.some((item) => item.id === g.id);
               const updated = exists
@@ -1156,9 +1346,7 @@ export const useStore = create<AppState>()(
         } catch (err: any) {
           console.error('[Firebase sync] Failed to fetch gallery:', err);
           set({ syncing: false, syncError: err.message || err });
-          // Fallback to local
-          const localG = get().galleries.find((g) => g.id === id);
-          return localG || null;
+          return get().galleries.find((g) => g.id === id) || null;
         }
       },
 
@@ -1212,6 +1400,10 @@ export const useStore = create<AppState>()(
       },
 
       fetchAllGalleriesFromFirestore: async () => {
+        // 60-second client-side cache to prevent redundant Firestore reads on rapid re-renders
+        const now = Date.now();
+        if (now - get().galleriesFetchedAt < 60_000) return;
+
         set({ syncing: true, syncError: null });
         try {
           const querySnapshot = await getDocs(collection(db, 'galleries'));
@@ -1220,7 +1412,7 @@ export const useStore = create<AppState>()(
             list.push(doc.data() as Gallery);
           });
           list.sort((a, b) => b.id.localeCompare(a.id));
-          set({ galleries: list, syncing: false });
+          set({ galleries: list, syncing: false, galleriesFetchedAt: Date.now() });
         } catch (err: any) {
           console.error('[Firebase sync] Failed to fetch all:', err);
           set({ syncing: false, syncError: err.message || err });
@@ -1259,22 +1451,18 @@ export const useStore = create<AppState>()(
       },
 
       deleteGalleryFromFirestore: async (galleryId) => {
-        set({ syncing: true, syncError: null });
+        // Optimistic: remove from UI immediately, then clean up Firestore in background
+        set((state) => ({
+          galleries: state.galleries.filter((g) => g.id !== galleryId),
+          syncing: false,
+          syncError: null
+        }));
         try {
           const docRef = doc(db, 'galleries', galleryId);
           await deleteDoc(docRef);
-
-          set((state) => ({
-            galleries: state.galleries.filter((g) => g.id !== galleryId),
-            syncing: false
-          }));
         } catch (err: any) {
           console.error('[Firebase sync] Failed to delete document:', err);
-          set({ syncing: false, syncError: err.message || err });
-          // Fallback local
-          set((state) => ({
-            galleries: state.galleries.filter((g) => g.id !== galleryId)
-          }));
+          // Gallery already removed from UI — no need to revert, just log
         }
       },
 

@@ -37,7 +37,10 @@ export interface Photo {
   uploadedAt?: string;
   uploadedBy?: string;
   galleryId?: string;
+  cloudinaryPublicId?: string;
   thumbnailUrl?: string;
+  previewUrl?: string;
+  blurDataUrl?: string;
   tags?: string[];
 }
 
@@ -85,6 +88,9 @@ export interface Gallery {
   submittedAt: string | null;
   extraPhotosCount: number;
   extraAmountDue: number;
+  uploadComplete?: boolean;
+  uploadedPhotosCount?: number;
+  downloadCode?: string;
 }
 
 export interface Notification {

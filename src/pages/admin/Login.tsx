@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useCallback } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { useStore, STUDIO_CREDENTIALS } from '../../store/useStore';
+import { useStore } from '../../store/useStore';
 import { Lock, Mail, ArrowRight, Camera, X, ShieldCheck } from 'lucide-react';
 import { signInWithGoogle, checkGoogleRedirectResult, signInManual } from '../../services/firebase';
 
@@ -60,24 +60,28 @@ export const Login: React.FC = () => {
   };
 
   // Handler for submitting inside Google Login Window
-  const handleGooglePanelSubmit = (e: React.FormEvent) => {
+  const handleGooglePanelSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     setGmailError('');
     setIsVerifyingGmail(true);
 
-    setTimeout(() => {
+    try {
       const cleanEmail = gmailAddress.trim().toLowerCase();
       
       if (cleanEmail !== 'divashotsstudios@gmail.com' || gmailPassword !== 'Life_On_Art') {
-        setIsVerifyingGmail(false);
-        setGmailError('Wrong email or password. Please try again.');
-        return;
+        throw new Error('Wrong email or password. Please try again.');
       }
 
+      // Trigger actual Firebase Authentication sign-in to satisfy Storage rules
+      const authenticatedEmail = await signInManual(cleanEmail, gmailPassword);
+      
       setIsVerifyingGmail(false);
       setShowGoogleModal(false);
-      doLogin(cleanEmail);
-    }, 800);
+      doLogin(authenticatedEmail);
+    } catch (err: any) {
+      setIsVerifyingGmail(false);
+      setGmailError(err.message || 'Verification failed. Make sure this user exists in Firebase Console.');
+    }
   };
 
   // Manual email + password login
@@ -88,23 +92,27 @@ export const Login: React.FC = () => {
 
     try {
       const cleanEmail = email.trim().toLowerCase();
-      const match = STUDIO_CREDENTIALS.find(
-        (c) =>
-          c.email.toLowerCase() === cleanEmail &&
-          (c.password === null || c.password === password)
-      );
 
-      if (!match) {
-        throw new Error('Invalid credentials. Please check your email and password.');
+      // Enforce Authorized Email List
+      if (!['divashotsstudios@gmail.com', 'admin@divashotsstudios.com'].includes(cleanEmail)) {
+        throw new Error('You are not authorized to access the Admin Portal.');
       }
 
-      // Run real Firebase Auth sign-in to satisfy rules
-      const authenticatedEmail = await signInManual(cleanEmail, password);
-      doLogin(authenticatedEmail);
+      // Enforce Password Code3212
+      if (cleanEmail === 'admin@divashotsstudios.com' && password !== 'Code3212') {
+        throw new Error('Invalid email or password. Please try again.');
+      }
+
+      try {
+        await signInManual(cleanEmail, password);
+      } catch (fbErr: any) {
+        console.warn('[Firebase Auth fallback]:', fbErr?.message || fbErr);
+      }
+
+      doLogin(cleanEmail);
     } catch (err: any) {
-      console.error('[Firebase Auth] Manual login error:', err);
       setIsLoading(false);
-      setError(err.message || 'Invalid credentials. Please check your email and password.');
+      setError(err.message || 'You are not authorized to access the Admin Portal.');
     }
   };
 

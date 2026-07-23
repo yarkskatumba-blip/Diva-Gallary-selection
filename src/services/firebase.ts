@@ -27,9 +27,13 @@ export const googleProvider = new GoogleAuthProvider();
 export const db = getFirestore(app);
 export const storage = getStorage(app);
 
-// Authenticate session anonymously to satisfy standard Firebase rules
-signInAnonymously(auth).catch((err) => {
-  console.warn('[Firebase Auth] Anonymous sign-in fallback: ', err.message || err);
+// Authenticate session anonymously if no user is signed in
+auth.onAuthStateChanged((user) => {
+  if (!user) {
+    signInAnonymously(auth).catch((err) => {
+      console.warn('[Firebase Auth] Anonymous sign-in fallback: ', err.message || err);
+    });
+  }
 });
 
 // Force Google to present the official Gmail sign-in / account selection panel
@@ -46,12 +50,12 @@ export const AUTHORIZED_EMAILS = [
  * Validates whether an email address is permitted to access the studio.
  */
 export function validateAuthorizedEmail(email: string): string {
-  const userEmail = email.toLowerCase();
-  const isAuthorized = AUTHORIZED_EMAILS.some(e => e.toLowerCase() === userEmail);
-  if (!isAuthorized) {
-    throw new Error(`Access Denied: Account "${userEmail}" is not authorized. Please sign in with divashotsstudios@gmail.com.`);
+  const clean = (email || '').trim().toLowerCase();
+  const allowed = AUTHORIZED_EMAILS.map((e) => e.toLowerCase());
+  if (!allowed.includes(clean)) {
+    throw new Error('You are not authorized to access the Admin Portal.');
   }
-  return userEmail;
+  return clean;
 }
 
 /**
@@ -96,12 +100,97 @@ export async function signInManual(email: string, password: string): Promise<str
   return validateAuthorizedEmail(result.user.email || '');
 }
 
+/**
+ * Retries an async function up to `maxAttempts` times with exponential backoff.
+ * Delays: 1s, 2s, 4s between attempts.
+ */
+export async function withRetry<T>(
+  fn: () => Promise<T>,
+  maxAttempts = 5
+): Promise<T> {
+  let lastErr: unknown;
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    try {
+      return await fn();
+    } catch (err) {
+      lastErr = err;
+      if (attempt < maxAttempts - 1) {
+        const delay = Math.pow(2, attempt) * 1000;
+        await new Promise((r) => setTimeout(r, delay));
+      }
+    }
+  }
+  throw lastErr;
+}
+
 export async function uploadPhotoToStorage(galleryId: string, photoId: string, file: File): Promise<string> {
-  // Use a clean path under galleries/{galleryId}/{photoId}_{filename}
-  const cleanFileName = file.name.replace(/[^a-zA-Z0-9.]/g, '_');
-  const fileRef = ref(storage, `galleries/${galleryId}/${photoId}_${cleanFileName}`);
-  await uploadBytes(fileRef, file);
-  return await getDownloadURL(fileRef);
+  try {
+    const cleanFileName = file.name.replace(/[^a-zA-Z0-9.]/g, '_');
+    const fileRef = ref(storage, `galleries/${galleryId}/uploads/${photoId}_${cleanFileName}`);
+    const metadata = {
+      contentType: file.type || 'image/jpeg',
+      cacheControl: 'public, max-age=31536000'
+    };
+    const result = await uploadBytes(fileRef, file, metadata);
+    return await getDownloadURL(result.ref);
+  } catch (err: any) {
+    const code = err?.code || 'storage/unknown';
+    const msg = err?.message || String(err);
+    console.error(`[Firebase Storage Error - ${code}]:`, msg, err);
+    throw new Error(`Storage upload failed (${code}): ${msg}`);
+  }
+}
+
+/**
+ * Uploads a thumbnail blob to `galleries/{galleryId}/uploads/thumbnails/{photoId}_thumb.jpg`.
+ * Returns the public download URL.
+ */
+export async function uploadThumbnailToStorage(
+  galleryId: string,
+  photoId: string,
+  blob: Blob | File
+): Promise<string> {
+  try {
+    const thumbFile = blob instanceof File ? blob : new File([blob], `${photoId}_thumb.jpg`, { type: 'image/jpeg' });
+    const thumbRef = ref(storage, `galleries/${galleryId}/uploads/thumbnails/${photoId}_thumb.jpg`);
+    const metadata = {
+      contentType: 'image/jpeg',
+      cacheControl: 'public, max-age=31536000'
+    };
+    const result = await uploadBytes(thumbRef, thumbFile, metadata);
+    return await getDownloadURL(result.ref);
+  } catch (err: any) {
+    const code = err?.code || 'storage/unknown';
+    const msg = err?.message || String(err);
+    console.warn(`[Firebase Storage Thumbnail Error - ${code}]:`, msg);
+    throw new Error(`Thumbnail upload failed (${code}): ${msg}`);
+  }
+}
+
+/**
+ * Uploads a preview blob (1200px) to `galleries/{galleryId}/uploads/previews/{photoId}_preview.jpg`.
+ * Returns the public download URL.
+ */
+export async function uploadPreviewToStorage(
+  galleryId: string,
+  photoId: string,
+  blob: Blob | File
+): Promise<string> {
+  try {
+    const previewFile = blob instanceof File ? blob : new File([blob], `${photoId}_preview.jpg`, { type: 'image/jpeg' });
+    const previewRef = ref(storage, `galleries/${galleryId}/uploads/previews/${photoId}_preview.jpg`);
+    const metadata = {
+      contentType: 'image/jpeg',
+      cacheControl: 'public, max-age=31536000'
+    };
+    const result = await uploadBytes(previewRef, previewFile, metadata);
+    return await getDownloadURL(result.ref);
+  } catch (err: any) {
+    const code = err?.code || 'storage/unknown';
+    const msg = err?.message || String(err);
+    console.warn(`[Firebase Storage Preview Error - ${code}]:`, msg);
+    throw new Error(`Preview upload failed (${code}): ${msg}`);
+  }
 }
 
 /**
@@ -115,8 +204,11 @@ export function uploadPhotoWithProgress(
 ): Promise<string> {
   return new Promise((resolve, reject) => {
     const cleanFileName = file.name.replace(/[^a-zA-Z0-9.]/g, '_');
-    const fileRef = ref(storage, `galleries/${galleryId}/${photoId}_${cleanFileName}`);
-    const uploadTask = uploadBytesResumable(fileRef, file);
+    const fileRef = ref(storage, `galleries/${galleryId}/uploads/${photoId}_${cleanFileName}`);
+    const uploadTask = uploadBytesResumable(fileRef, file, {
+      contentType: file.type || 'image/jpeg',
+      cacheControl: 'public, max-age=31536000'
+    });
 
     uploadTask.on(
       'state_changed',
